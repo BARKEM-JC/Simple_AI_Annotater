@@ -1,0 +1,15 @@
+{
+  "df6feaa2-f42a-4106-aa68-f75ebf340e07": {
+    "label": "test_template",
+    "threshold": 0.7,
+    "template_data": "iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAIAAACRXR/mAAAAX0lEQVRYCc3BAQEAAABAIP6fdkPJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkizJkiwFDbgAM/PLBkEAAAAASUVORK5CYII=",
+    "original_region": {
+      "x": 10,
+      "y": 10,
+      "width": 50,
+      "height": 50
+    },
+    "created_timestamp": "2025-06-06T09:13:59.887505",
+    "usage_count": 0
+  }
+}
