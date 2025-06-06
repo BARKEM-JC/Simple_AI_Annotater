@@ -37,14 +37,7 @@ class AILabelerMainWindow(QMainWindow):
         # Create output directory
         self.output_dir = Path("labeled_data")
         self.output_dir.mkdir(exist_ok=True)
-        
-        # Tracking state
-        self.tracking_active = False
-        self.tracking_start_frame = None
-        self.tracking_end_frame = None
-        self.trackers = []  # List of OpenCV trackers
-        self.tracking_regions = []  # Initial regions and their tracking data
-        
+
         # Persistent annotations state
         self.persistent_annotations = {}  # Map of annotation IDs to their data
         self.deleted_annotations = set()  # Set of deleted annotation IDs
@@ -182,26 +175,6 @@ class AILabelerMainWindow(QMainWindow):
         
         controls_layout.addLayout(slider_layout)
         layout.addLayout(controls_layout)
-        
-        # Tracking controls
-        tracking_layout = QHBoxLayout()
-        self.start_tracking_btn = QPushButton("Start Tracking")
-        self.start_tracking_btn.clicked.connect(self.start_tracking)
-        self.start_tracking_btn.setEnabled(False)
-        tracking_layout.addWidget(self.start_tracking_btn)
-        
-        self.end_tracking_btn = QPushButton("End Tracking")
-        self.end_tracking_btn.clicked.connect(self.end_tracking)
-        self.end_tracking_btn.setEnabled(False)
-        tracking_layout.addWidget(self.end_tracking_btn)
-        
-        self.cancel_tracking_btn = QPushButton("Cancel Tracking")
-        self.cancel_tracking_btn.clicked.connect(self.cancel_tracking)
-        self.cancel_tracking_btn.setEnabled(False)
-        tracking_layout.addWidget(self.cancel_tracking_btn)
-        
-        tracking_layout.addStretch()
-        controls_layout.addLayout(tracking_layout)
         
         return panel
     
@@ -438,7 +411,6 @@ class AILabelerMainWindow(QMainWindow):
                 self.frame_spinbox.setValue(0)
                 
                 # Reset tracking and persistent annotation state
-                self.cancel_tracking()
                 self.reset_persistent_annotation_state()
                 
                 self.status_bar.showMessage(f"Video loaded: {self.frame_count} frames")
@@ -495,7 +467,6 @@ class AILabelerMainWindow(QMainWindow):
                 self.frame_spinbox.setValue(0)
                 
                 # Reset tracking and persistent annotation state
-                self.cancel_tracking()
                 self.reset_persistent_annotation_state()
                 
                 self.status_bar.showMessage(f"Images loaded: {self.frame_count} files")
@@ -566,9 +537,6 @@ class AILabelerMainWindow(QMainWindow):
         
         # Update synthetic data widget with current frame and regions
         self.update_synthetic_data_widget()
-        
-        # Enable tracking button if we have regions and not currently tracking
-        self.start_tracking_btn.setEnabled(len(self.video_player.regions) > 0 and not self.tracking_active)
         
         # Trigger auto-annotation if enabled
         if self.auto_annotation_enabled:
@@ -1005,284 +973,8 @@ class AILabelerMainWindow(QMainWindow):
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error loading synthetic image:\n{str(e)}")
-
-    def start_tracking(self):
-        """Start tracking all annotations on the current frame"""
-        if self.current_frame is None or len(self.video_player.regions) == 0:
-            QMessageBox.warning(self, "Warning", "No frame loaded or no annotations to track")
-            return
-        
-        # Initialize tracking
-        self.tracking_active = True
-        self.tracking_start_frame = self.current_frame_index
-        self.tracking_end_frame = None
-        self.trackers = []
-        self.tracking_regions = []
-        
-        # Initialize trackers for each region
-        start_frame = self.current_frame.copy()
-        for region in self.video_player.regions:
-            try:
-                # Create tracker - trying different tracker types for better compatibility
-                tracker = None
-                tracker_name = "Unknown"
-                
-                # Try different trackers in order of preference
-                try:
-                    tracker = cv2.legacy.TrackerCSRT_create()
-                    tracker_name = "CSRT"
-                except:
-                    try:
-                        tracker = cv2.legacy.TrackerKCF_create()
-                        tracker_name = "KCF"
-                    except:
-                        try:
-                            tracker = cv2.legacy.TrackerMIL_create()
-                            tracker_name = "MIL"
-                        except:
-                            # Fallback for newer OpenCV versions
-                            try:
-                                tracker = cv2.TrackerCSRT_create()
-                                tracker_name = "CSRT"
-                            except:
-                                try:
-                                    tracker = cv2.TrackerKCF_create()
-                                    tracker_name = "KCF"
-                                except:
-                                    pass
-                
-                if tracker is None:
-                    print(f"Could not create tracker for region {region.id}")
-                    continue
-                
-                # Get region bounds
-                bbox = (region.x, region.y, region.width, region.height)
-                
-                # Initialize tracker
-                success = tracker.init(start_frame, bbox)
-                if success:
-                    self.trackers.append(tracker)
-                    region_data = self.video_player.get_region_data(region.id)
-                    self.tracking_regions.append({
-                        'original_data': region_data.copy(),
-                        'region_id': region.id,
-                        'label': region.label,
-                        'initial_bbox': bbox,
-                        'tracker_type': tracker_name
-                    })
-                    print(f"Initialized {tracker_name} tracker for region {region.id}")
-                else:
-                    print(f"Failed to initialize tracker for region {region.id}")
-                    
-            except Exception as e:
-                print(f"Error creating tracker for region {region.id}: {e}")
-        
-        if self.trackers:
-            # Update UI
-            self.start_tracking_btn.setEnabled(False)
-            self.end_tracking_btn.setEnabled(True)
-            self.cancel_tracking_btn.setEnabled(False)
-            self.status_bar.showMessage(f"Tracking started at frame {self.tracking_start_frame + 1}. Initialized {len(self.trackers)} trackers.")
-        else:
-            # No trackers could be initialized
-            self.cancel_tracking()
-            QMessageBox.warning(self, "Warning", "Could not initialize any trackers. OpenCV tracking may not be available.")
-
-    def end_tracking(self):
-        """End tracking and apply tracked positions to all frames between start and end"""
-        if not self.tracking_active or not self.trackers:
-            return
-        
-        self.tracking_end_frame = self.current_frame_index
-        
-        if self.tracking_end_frame <= self.tracking_start_frame:
-            QMessageBox.warning(self, "Warning", "End frame must be after start frame")
-            return
-        
-        try:
-            # Apply tracking to all frames
-            self.apply_tracking_to_frames()
-            self.status_bar.showMessage(f"Tracking completed from frame {self.tracking_start_frame + 1} to {self.tracking_end_frame + 1}")
             
-        except Exception as e:
-            print(f"Error during tracking: {e}")
-            QMessageBox.critical(self, "Error", f"Tracking failed: {str(e)}")
-        
-        finally:
-            # Clean up tracking state
-            self.tracking_active = False
-            self.trackers = []
-            self.tracking_regions = []
             
-            # Update UI
-            self.start_tracking_btn.setEnabled(True)
-            self.end_tracking_btn.setEnabled(False)
-            self.cancel_tracking_btn.setEnabled(False)
-            
-            # Refresh current frame to show updated annotations
-            self.load_frame_annotations(self.current_frame_index)
-
-    def cancel_tracking(self):
-        """Cancel tracking and restore original state"""
-        self.tracking_active = False
-        self.tracking_start_frame = None
-        self.tracking_end_frame = None
-        self.trackers = []
-        self.tracking_regions = []
-        
-        # Update UI
-        self.start_tracking_btn.setEnabled(True)
-        self.end_tracking_btn.setEnabled(False)
-        self.cancel_tracking_btn.setEnabled(False)
-        self.status_bar.showMessage("Tracking cancelled")
-
-    def apply_tracking_to_frames(self):
-        """Apply actual object tracking to all frames between start and end"""
-        if not self.tracking_active or not self.trackers:
-            return
-        
-        # Store current frame index to restore later
-        original_frame_index = self.current_frame_index
-        
-        # Reset trackers to start frame
-        self.video_player.seek_frame(self.tracking_start_frame)
-        start_frame = self.current_frame.copy()
-        
-        # Re-initialize trackers at start frame to ensure they're fresh
-        fresh_trackers = []
-        for i, (tracker, region_info) in enumerate(zip(self.trackers, self.tracking_regions)):
-            try:
-                # Create fresh tracker of same type
-                fresh_tracker = None
-                tracker_type = region_info.get('tracker_type', 'CSRT')
-                
-                if tracker_type == "CSRT":
-                    try:
-                        fresh_tracker = cv2.legacy.TrackerCSRT_create()
-                    except:
-                        fresh_tracker = cv2.TrackerCSRT_create()
-                elif tracker_type == "KCF":
-                    try:
-                        fresh_tracker = cv2.legacy.TrackerKCF_create()
-                    except:
-                        fresh_tracker = cv2.TrackerKCF_create()
-                elif tracker_type == "MIL":
-                    try:
-                        fresh_tracker = cv2.legacy.TrackerMIL_create()
-                    except:
-                        fresh_tracker = cv2.TrackerMIL_create()
-                
-                if fresh_tracker and fresh_tracker.init(start_frame, region_info['initial_bbox']):
-                    fresh_trackers.append(fresh_tracker)
-                else:
-                    fresh_trackers.append(None)
-                    print(f"Failed to reinitialize tracker {i}")
-                    
-            except Exception as e:
-                print(f"Error reinitializing tracker {i}: {e}")
-                fresh_trackers.append(None)
-        
-        # Track through each frame
-        for frame_idx in range(self.tracking_start_frame + 1, self.tracking_end_frame + 1):
-            try:
-                # Load the frame
-                self.video_player.seek_frame(frame_idx)
-                current_frame = self.current_frame.copy()
-                
-                if current_frame is None:
-                    print(f"Could not load frame {frame_idx}")
-                    continue
-                
-                # Update all trackers
-                tracked_regions = []
-                for i, (tracker, region_info) in enumerate(zip(fresh_trackers, self.tracking_regions)):
-                    if tracker is None:
-                        # If tracker failed, use original position (fallback)
-                        original_data = region_info['original_data']
-                        tracked_regions.append(original_data.copy())
-                        continue
-                    
-                    try:
-                        success, bbox = tracker.update(current_frame)
-                        if success:
-                            x, y, w, h = [int(v) for v in bbox]
-                            # Create tracked region data
-                            tracked_region = region_info['original_data'].copy()
-                            tracked_region.update({
-                                'id': f"tracked_{region_info['region_id']}_{frame_idx}",
-                                'x': x,
-                                'y': y,
-                                'width': w,
-                                'height': h,
-                                'tracked': True,
-                                'source_frame': self.tracking_start_frame,
-                                'tracker_type': region_info.get('tracker_type', 'Unknown')
-                            })
-                            tracked_regions.append(tracked_region)
-                        else:
-                            # Tracking failed, use original position
-                            print(f"Tracking failed for region {i} at frame {frame_idx}")
-                            original_data = region_info['original_data'].copy()
-                            original_data['id'] = f"fallback_{region_info['region_id']}_{frame_idx}"
-                            original_data['tracked'] = False
-                            original_data['tracking_failed'] = True
-                            tracked_regions.append(original_data)
-                            
-                    except Exception as e:
-                        print(f"Error updating tracker {i} at frame {frame_idx}: {e}")
-                        # Use original position as fallback
-                        original_data = region_info['original_data'].copy()
-                        original_data['id'] = f"error_{region_info['region_id']}_{frame_idx}"
-                        tracked_regions.append(original_data)
-                
-                # Save tracked annotations to this frame
-                self.save_tracked_annotations(frame_idx, tracked_regions)
-                
-            except Exception as e:
-                print(f"Error processing frame {frame_idx}: {e}")
-                continue
-        
-        # Restore original frame
-        if original_frame_index is not None:
-            self.video_player.seek_frame(original_frame_index)
-
-    def save_tracked_annotations(self, frame_idx, tracked_regions):
-        """Save tracked regions to a specific frame"""
-        try:
-            annotation_file = self.output_dir / f"frame_{frame_idx:06d}.json"
-            
-            # Load existing data or create new
-            frame_data = {
-                'frame_index': frame_idx,
-                'video_path': self.video_path,
-                'frame_labels': [],
-                'regions': [],
-                'timestamp': time.time()
-            }
-            
-            # Load existing annotations if they exist
-            if annotation_file.exists():
-                try:
-                    with open(annotation_file, 'r') as f:
-                        frame_data = json.load(f)
-                except Exception as e:
-                    print(f"Error loading existing annotations for frame {frame_idx}: {e}")
-            
-            # Get existing regions and remove old tracked regions
-            existing_regions = [r for r in frame_data.get('regions', []) if not r.get('tracked', False)]
-            
-            # Add new tracked regions
-            all_regions = existing_regions + tracked_regions
-            frame_data['regions'] = all_regions
-            frame_data['timestamp'] = time.time()
-            
-            # Save annotations
-            with open(annotation_file, 'w') as f:
-                json.dump(frame_data, f, indent=2)
-                
-        except Exception as e:
-            print(f"Error saving tracked annotations for frame {frame_idx}: {e}")
-
     def find_overlapping_region(self, track_region, existing_regions):
         """Find if there's an existing region that overlaps significantly with the track region"""
         track_x = track_region.get('x', 0)
