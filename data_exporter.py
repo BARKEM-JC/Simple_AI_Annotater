@@ -538,8 +538,8 @@ names: {classes_list}
         """Export in MoViNet format for video classification"""
         try:
             # Create MoViNet directory structure
-            clips_dir = self.export_dir / "clips"
-            clips_dir.mkdir(exist_ok=True)
+            videos_dir = self.export_dir / "videos"
+            videos_dir.mkdir(exist_ok=True)
             
             # Collect all unique labels
             all_labels = set()
@@ -557,6 +557,11 @@ names: {classes_list}
             if not classes_list:
                 print("No class labels found in clips")
                 return False
+            
+            # Create class-based directories
+            for class_name in classes_list:
+                class_dir = videos_dir / class_name
+                class_dir.mkdir(exist_ok=True)
             
             # Save classes file
             classes_file = self.export_dir / "classes.txt"
@@ -586,45 +591,27 @@ names: {classes_list}
                 label = clip_info['label']
                 clip_id = clip_info.get('id', f"clip_{start_frame}_{end_frame}")
                 
-                # Create clip directory
-                clip_dir = clips_dir / clip_id
-                clip_dir.mkdir(exist_ok=True)
+                # Create video file for this clip
+                video_filename = f"{clip_id}.mp4"
+                video_path = videos_dir / label / video_filename
                 
-                # Extract frames for the clip
-                frames_extracted = []
-                frame_count = end_frame - start_frame + 1
+                # Extract video clip
+                success = self.extract_video_clip(source_path, source_type, start_frame, end_frame, video_path)
                 
-                # Use all frames - no maximum limit enforced
-                frame_indices = list(range(start_frame, end_frame + 1))
-                
-                for i, frame_idx in enumerate(frame_indices):
-                    # Load frame from source using standardized method
-                    frame = self.load_frame_from_source(source_path, source_type, frame_idx)
-                    if frame is None:
-                        continue
+                if success:
+                    # Add to dataset metadata
+                    clip_metadata = {
+                        "clip_id": clip_id,
+                        "video_file": str(video_path.relative_to(self.export_dir)),
+                        "label": label,
+                        "class_id": label_to_id[label],
+                        "start_frame": start_frame,
+                        "end_frame": end_frame,
+                        "frame_count": end_frame - start_frame + 1,
+                        "duration_frames": end_frame - start_frame + 1
+                    }
                     
-                    # Resize to 224x224 for MoViNet
-                    frame_resized = cv2.resize(frame, (224, 224))
-                    
-                    # Save frame
-                    frame_filename = f"frame_{i:04d}.jpg"
-                    frame_path = clip_dir / frame_filename
-                    cv2.imwrite(str(frame_path), frame_resized)
-                    frames_extracted.append(frame_filename)
-                
-                # Add to dataset metadata
-                clip_metadata = {
-                    "clip_id": clip_id,
-                    "label": label,
-                    "class_id": label_to_id[label],
-                    "start_frame": start_frame,
-                    "end_frame": end_frame,
-                    "frames": frames_extracted,
-                    "frame_count": len(frames_extracted),
-                    "resolution": [224, 224]
-                }
-                
-                dataset_metadata["clips"].append(clip_metadata)
+                    dataset_metadata["clips"].append(clip_metadata)
                 
                 processed += 1
                 if progress_callback:
@@ -645,6 +632,81 @@ names: {classes_list}
             
         except Exception as e:
             print(f"MoViNet export error: {e}")
+            return False
+    
+    def extract_video_clip(self, source_path, source_type, start_frame, end_frame, output_path):
+        """Extract a video clip from the source"""
+        try:
+            if source_type == 'video':
+                # Use OpenCV to extract video clip
+                cap = cv2.VideoCapture(str(source_path))
+                if not cap.isOpened():
+                    print(f"Failed to open video: {source_path}")
+                    return False
+                
+                # Get video properties
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                
+                # Create video writer
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+                
+                # Set start position
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                
+                # Extract frames
+                for frame_idx in range(start_frame, end_frame + 1):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    out.write(frame)
+                
+                # Clean up
+                cap.release()
+                out.release()
+                
+                return True
+                
+            else:  # image sequence
+                # For image sequences, create video from images
+                image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+                image_files = []
+                source_path = Path(source_path)
+                for ext in image_extensions:
+                    image_files.extend(source_path.glob(f"*{ext}"))
+                    image_files.extend(source_path.glob(f"*{ext.upper()}"))
+                image_files = sorted(image_files)
+                
+                if not image_files or end_frame >= len(image_files):
+                    print(f"Not enough images for clip {start_frame}-{end_frame}")
+                    return False
+                
+                # Read first image to get dimensions
+                first_frame = cv2.imread(str(image_files[start_frame]))
+                if first_frame is None:
+                    return False
+                
+                height, width = first_frame.shape[:2]
+                
+                # Create video writer (assume 30 fps for image sequences)
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(str(output_path), fourcc, 30.0, (width, height))
+                
+                # Write frames
+                for frame_idx in range(start_frame, min(end_frame + 1, len(image_files))):
+                    frame = cv2.imread(str(image_files[frame_idx]))
+                    if frame is not None:
+                        out.write(frame)
+                
+                # Clean up
+                out.release()
+                
+                return True
+                
+        except Exception as e:
+            print(f"Error extracting video clip: {e}")
             return False
     
     def create_movinet_splits(self, dataset_metadata, train_ratio=0.8):
@@ -675,7 +737,7 @@ names: {classes_list}
             "input_resolution": [224, 224],
             "sequence_length_range": [5, 64],
             "fps": 30,
-            "data_path": str(self.export_dir / "clips"),
+            "data_path": str(self.export_dir / "videos"),
             "metadata_path": str(self.export_dir / "dataset.json"),
             "splits_path": str(self.export_dir / "splits.json")
         }
@@ -690,11 +752,12 @@ import json
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image
+import cv2
 import os
+import numpy as np
 
 class MoViNetDataset(Dataset):
-    def __init__(self, config_path, split='train', transform=None):
+    def __init__(self, config_path, split='train', transform=None, max_frames=64):
         with open(config_path, 'r') as f:
             self.config = json.load(f)
         
@@ -706,7 +769,10 @@ class MoViNetDataset(Dataset):
         
         self.clip_ids = splits[split]
         self.clips = [clip for clip in self.metadata['clips'] if clip['clip_id'] in self.clip_ids]
+        self.max_frames = max_frames
         self.transform = transform or transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
@@ -716,135 +782,70 @@ class MoViNetDataset(Dataset):
     
     def __getitem__(self, idx):
         clip = self.clips[idx]
-        clip_path = os.path.join(self.config['data_path'], clip['clip_id'])
+        video_path = os.path.join(os.path.dirname(self.config['metadata_path']), clip['video_file'])
         
-        frames = []
-        for frame_name in sorted(clip['frames']):
-            frame_path = os.path.join(clip_path, frame_name)
-            frame = Image.open(frame_path).convert('RGB')
-            if self.transform:
-                frame = self.transform(frame)
-            frames.append(frame)
+        # Load video frames
+        frames = self.load_video_frames(video_path)
+        
+        if len(frames) == 0:
+            # Return dummy data if video couldn't be loaded
+            frames = [torch.zeros(3, 224, 224) for _ in range(8)]
+        
+        # Sample or pad frames to max_frames
+        if len(frames) > self.max_frames:
+            # Sample frames uniformly
+            indices = np.linspace(0, len(frames) - 1, self.max_frames, dtype=int)
+            frames = [frames[i] for i in indices]
+        elif len(frames) < self.max_frames:
+            # Repeat last frame to reach max_frames
+            while len(frames) < self.max_frames:
+                frames.append(frames[-1])
         
         # Stack frames into tensor (T, C, H, W)
         video_tensor = torch.stack(frames)
         label = clip['class_id']
         
         return video_tensor, label
+    
+    def load_video_frames(self, video_path):
+        """Load all frames from video file"""
+        frames = []
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            print(f"Warning: Could not open video {video_path}")
+            return frames
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Apply transforms
+            if self.transform:
+                frame_tensor = self.transform(frame_rgb)
+                frames.append(frame_tensor)
+        
+        cap.release()
+        return frames
 
 # Example usage:
-# dataset = MoViNetDataset('pytorch_config.json', split='train')
-# dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+# dataset = MoViNetDataset('pytorch_config.json', split='train', max_frames=32)
+# dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+# 
+# # For training with MoViNet:
+# for batch_idx, (videos, labels) in enumerate(dataloader):
+#     # videos shape: (batch_size, num_frames, channels, height, width)
+#     # labels shape: (batch_size,)
+#     print(f"Batch {batch_idx}: Video shape {videos.shape}, Labels {labels}")
 '''
         
         example_file = self.export_dir / "example_pytorch_loader.py"
         with open(example_file, 'w') as f:
             f.write(example_code)
-    
-    def convert_frame_annotations_to_clips(self, video_path, annotation_files, clip_duration_frames=30):
-        """
-        Convert frame annotations to clips for MoViNet export
-        
-        Args:
-            video_path: Path to the video file
-            annotation_files: List of frame annotation files
-            clip_duration_frames: Number of frames per clip (default 30 = ~1 second at 30fps)
-            
-        Returns:
-            List of clip file paths created
-        """
-        print("Converting frame annotations to clips for MoViNet...")
-        
-        # Group frame annotations by label to create coherent clips
-        frames_by_label = {}
-        
-        for annotation_file in annotation_files:
-            with open(annotation_file, 'r') as f:
-                data = json.load(f)
-            
-            frame_index = data['frame_index']
-            
-            # Use frame labels if available, otherwise use region labels
-            labels = data.get('frame_labels', [])
-            if not labels and data.get('regions'):
-                labels = [region.get('label') for region in data['regions'] if region.get('label')]
-            
-            for label in labels:
-                if label not in frames_by_label:
-                    frames_by_label[label] = []
-                frames_by_label[label].append(frame_index)
-        
-        if not frames_by_label:
-            print("No frame labels found to convert to clips")
-            return []
-        
-        # Create clips from grouped frames
-        clip_files = []
-        clip_id = 1
-        
-        for label, frame_indices in frames_by_label.items():
-            frame_indices.sort()
-            
-            # Group consecutive frames into sequences
-            sequences = []
-            current_sequence = [frame_indices[0]]
-            
-            for i in range(1, len(frame_indices)):
-                if frame_indices[i] == frame_indices[i-1] + 1:
-                    # Consecutive frame
-                    current_sequence.append(frame_indices[i])
-                else:
-                    # Gap found, start new sequence
-                    sequences.append(current_sequence)
-                    current_sequence = [frame_indices[i]]
-            
-            # Add the last sequence
-            sequences.append(current_sequence)
-            
-            # Create clips from sequences
-            for sequence in sequences:
-                start_frame = sequence[0]
-                end_frame = sequence[-1]
-                
-                # Extend short sequences to meet minimum requirements
-                if len(sequence) < 5:
-                    # Try to extend the sequence to 5 frames
-                    needed_frames = 5 - len(sequence)
-                    # Extend forward first, then backward if needed
-                    extended_end = end_frame + needed_frames
-                    if extended_end - start_frame + 1 >= 5:
-                        end_frame = extended_end
-                    else:
-                        # Try extending backward
-                        extended_start = max(0, start_frame - needed_frames)
-                        start_frame = extended_start
-                        if end_frame - start_frame + 1 < 5:
-                            end_frame = start_frame + 4  # Minimum 5 frames
-                
-                clip_length = end_frame - start_frame + 1
-                
-                if clip_length >= 5:  # MoViNet minimum
-                    clip_data = {
-                        "id": f"auto_clip_{clip_id:03d}",
-                        "start_frame": start_frame,
-                        "end_frame": end_frame,
-                        "label": label,
-                        "description": f"Auto-generated clip from frame annotations ({label})",
-                        "auto_generated": True
-                    }
-                    
-                    # Save clip file
-                    clip_file = self.data_dir / f"clip_{clip_id:03d}.json"
-                    with open(clip_file, 'w') as f:
-                        json.dump(clip_data, f, indent=2)
-                    
-                    clip_files.append(clip_file)
-                    clip_id += 1
-                    
-                    print(f"Created clip: {label} (frames {start_frame}-{end_frame}, {clip_length} frames)")
-        
-        print(f"Created {len(clip_files)} clips from frame annotations")
-        return clip_files
     
     def apply_augmentations(self, frame, augmentations):
         """Apply selected augmentations to a frame"""
