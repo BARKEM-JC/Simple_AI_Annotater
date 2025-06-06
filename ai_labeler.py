@@ -50,14 +50,14 @@ class AILabelerMainWindow(QMainWindow):
         self.deleted_annotations = set()  # Set of deleted annotation IDs
         
         # Auto-annotation state
-        self.auto_annotation_enabled = False
+        self.auto_annotation_enabled = True
         self.auto_annotation_timer = QTimer()
         self.auto_annotation_timer.setSingleShot(True)
         self.auto_annotation_timer.timeout.connect(self.run_auto_annotation)
-        self.auto_annotation_delay = 500  # 0.5 seconds in milliseconds
+        self.auto_annotation_delay = 0
         
         # Frame change tracking for persistence
-        self.should_persist_annotations = False
+        self._last_frame_index = None
         
         self.init_ui()
         self.setup_shortcuts()
@@ -67,7 +67,6 @@ class AILabelerMainWindow(QMainWindow):
         """Reset all persistent annotation tracking state"""
         self.persistent_annotations = {}
         self.deleted_annotations = set()
-        self.should_persist_annotations = False
         self._last_frame_index = None
         
     def init_ui(self):
@@ -508,29 +507,23 @@ class AILabelerMainWindow(QMainWindow):
             self.video_player.pause()
             self.play_btn.setText("Play")
         else:
-            self.should_persist_annotations = False  # No persistence during video playback
             self.video_player.play()
             self.play_btn.setText("Pause")
     
     def previous_frame(self):
-        self.should_persist_annotations = False  # No persistence for previous frame
         self.video_player.previous_frame()
     
     def next_frame(self):
-        self.should_persist_annotations = True  # Enable persistence for next frame
         self.video_player.next_frame()
     
     def skip_frames(self):
-        self.should_persist_annotations = False  # No persistence for skip
         self.video_player.skip_frames(10)
     
     def skip_frames_back(self):
-        self.should_persist_annotations = False  # No persistence for skip back
         self.video_player.skip_frames(-10)
     
     def seek_frame(self, frame_index):
         if frame_index != self.current_frame_index:
-            self.should_persist_annotations = False  # No persistence for seek
             self.video_player.seek_frame(frame_index)
             self.frame_spinbox.blockSignals(True)
             self.frame_spinbox.setValue(frame_index)
@@ -538,7 +531,6 @@ class AILabelerMainWindow(QMainWindow):
     
     def seek_frame_spinbox(self, frame_index):
         if frame_index != self.current_frame_index:
-            self.should_persist_annotations = False  # No persistence for spinbox seek
             self.video_player.seek_frame(frame_index)
             self.frame_slider.blockSignals(True)
             self.frame_slider.setValue(frame_index)
@@ -591,79 +583,70 @@ class AILabelerMainWindow(QMainWindow):
         if not hasattr(self, '_last_frame_index') or self._last_frame_index is None:
             self._last_frame_index = frame_index
             return
-        
-        # Only apply persistence when explicitly requested (next frame button pressed)
-        if not self.should_persist_annotations:
-            self._last_frame_index = frame_index
-            return
-        
-        # Reset the flag after checking
-        self.should_persist_annotations = False
-        
-        # Check if we're moving forward to the next consecutive frame
+
+        # Only apply persistence when moving forward to the next consecutive frame
         if self._last_frame_index == frame_index - 1:
-            # Check if current frame already has annotations - if so, don't override
-            current_annotation_file = self.output_dir / f"frame_{frame_index:06d}.json"
-            if current_annotation_file.exists():
-                self._last_frame_index = frame_index
-                return
-            
-            # Get annotations from the previous frame
             source_frame_index = self._last_frame_index
             source_annotation_file = self.output_dir / f"frame_{source_frame_index:06d}.json"
-            
-            if source_annotation_file.exists():
-                try:
-                    with open(source_annotation_file, 'r') as f:
-                        source_data = json.load(f)
-                    
-                    # Copy all regions from previous frame (except those marked as deleted)
-                    persistent_regions = []
-                    for i, region_data in enumerate(source_data.get('regions', [])):
-                        region_id = region_data.get('id', '')
-                        
-                        # Skip regions that were marked as deleted in the current session
-                        # Use a more robust check that considers the base ID without frame prefix
-                        base_id = region_id.replace(f'persistent_{source_frame_index}_', '')
-                        if any(deleted_id in region_id or region_id in deleted_id or base_id in deleted_id for deleted_id in self.deleted_annotations):
-                            continue
-                        
-                        # Create new region with updated ID for this frame
-                        new_region_data = region_data.copy()
-                        new_region_data['id'] = f"persistent_{frame_index}_{i}"
-                        new_region_data['persistent'] = True
-                        persistent_regions.append(new_region_data)
-                        
-                        # Add to video player immediately
-                        self.video_player.add_region_from_data(new_region_data)
-                    
-                    # Also persist frame labels
-                    frame_labels = source_data.get('frame_labels', [])
-                    
-                    # Update UI with persisted frame labels
-                    self.frame_labels_list.clear()
-                    for label in frame_labels:
-                        item = QListWidgetItem(label)
-                        self.frame_labels_list.addItem(item)
-                    
-                    # Save persistent annotations to current frame if we have any
-                    if persistent_regions or frame_labels:
-                        current_data = {
-                            'frame_index': frame_index,
-                            'video_path': self.video_path,
-                            'frame_labels': frame_labels,
-                            'regions': persistent_regions,
-                            'timestamp': time.time()
-                        }
-                        
-                        with open(current_annotation_file, 'w') as f:
-                            json.dump(current_data, f, indent=2)
-                        
-                        self.status_bar.showMessage(f"Persisted {len(persistent_regions)} annotations from previous frame")
-                
-                except Exception as e:
-                    print(f"Error applying persistent annotations: {e}")
-        
+
+            if not source_annotation_file.exists():
+                self._last_frame_index = frame_index
+                return
+
+            try:
+                with open(source_annotation_file, 'r') as f:
+                    source_data = json.load(f)
+            except Exception as e:
+                print(f"Error reading source annotation file: {e}")
+                self._last_frame_index = frame_index
+                return
+
+            # Get regions and labels to persist
+            source_regions = source_data.get('regions', [])
+            source_frame_labels = source_data.get('frame_labels', [])
+
+            if not source_regions and not source_frame_labels:
+                self._last_frame_index = frame_index
+                return
+
+            # Get current frame's annotations from the UI elements
+            current_regions = self.video_player.get_all_regions_data()
+            current_frame_labels = [self.frame_labels_list.item(i).text() for i in range(self.frame_labels_list.count())]
+
+            persistent_regions_to_add = []
+            for i, region_data in enumerate(source_regions):
+                # Preserve original_id if it exists, otherwise use the parent's id
+                original_id = region_data.get('original_id', region_data.get('id'))
+                if original_id in self.deleted_annotations:
+                    continue
+
+                # Check for overlap with existing regions on the new frame
+                if self.find_overlapping_region(region_data, current_regions) is not None:
+                    continue
+
+                # Create new region with updated ID for this frame
+                new_region_data = region_data.copy()
+                new_region_data['original_id'] = original_id
+                new_region_data['id'] = f"persistent_{frame_index}_{i}"
+                new_region_data['persistent'] = True
+                persistent_regions_to_add.append(new_region_data)
+
+            # Persist frame labels (combine without duplicates)
+            persistent_frame_labels_to_add = [label for label in source_frame_labels if label not in current_frame_labels]
+
+            # If there's anything to add, update and save
+            if persistent_regions_to_add or persistent_frame_labels_to_add:
+                # Add to video player and UI immediately
+                for region in persistent_regions_to_add:
+                    self.video_player.add_region_from_data(region)
+                for label in persistent_frame_labels_to_add:
+                    self.frame_labels_list.addItem(QListWidgetItem(label))
+
+                # Save the merged annotations
+                self.save_frame_annotations()
+
+                self.status_bar.showMessage(f"Persisted {len(persistent_regions_to_add)} annotations and {len(persistent_frame_labels_to_add)} labels.")
+
         # Update last frame index for next consecutive check
         self._last_frame_index = frame_index
 
@@ -729,37 +712,25 @@ class AILabelerMainWindow(QMainWindow):
             self.save_frame_annotations()
     
     def delete_selected_region(self):
-        selected_region = self.video_player.get_selected_region()
-        if selected_region:
-            # Disable persistence when deleting regions
-            self.should_persist_annotations = False
-            
-            # Add the region ID and its base ID to deleted annotations to prevent persistence
-            self.deleted_annotations.add(selected_region)
-            
-            # Also add the base ID (without frame prefix) to prevent future persistence
-            if selected_region.startswith('persistent_'):
-                # Extract base ID pattern: persistent_framenum_index -> index
-                parts = selected_region.split('_')
-                if len(parts) >= 3:
-                    base_index = parts[2]
-                    self.deleted_annotations.add(base_index)
-                    # Also add pattern to catch other variations
-                    self.deleted_annotations.add(f"persistent_*_{base_index}")
-            
-            # Remove from persistent annotations
-            self.persistent_annotations.pop(selected_region, None)
-            
-            self.video_player.delete_region(selected_region)
-            self.label_manager.remove_region(selected_region)
+        selected_region_id = self.video_player.get_selected_region()
+        if selected_region_id:
+            region_data = self.video_player.get_region_data(selected_region_id)
+
+            # Add the original ID to deleted annotations to prevent persistence
+            if region_data:
+                original_id = region_data.get('original_id', selected_region_id)
+                self.deleted_annotations.add(original_id)
+
+            # Remove from persistent annotations dict
+            self.persistent_annotations.pop(selected_region_id, None)
+
+            self.video_player.delete_region(selected_region_id)
+            self.label_manager.remove_region(selected_region_id)
             self.delete_region_btn.setEnabled(False)
             # Save frame automatically when region is deleted
             self.save_frame_annotations()
     
     def clear_all_regions(self):
-        # Disable persistence when clearing all regions
-        self.should_persist_annotations = False
-        
         self.video_player.clear_regions()
         self.label_manager.clear_regions()
         self.delete_region_btn.setEnabled(False)
