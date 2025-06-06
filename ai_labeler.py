@@ -47,7 +47,7 @@ class AILabelerMainWindow(QMainWindow):
         self.auto_annotation_timer = QTimer()
         self.auto_annotation_timer.setSingleShot(True)
         self.auto_annotation_timer.timeout.connect(self.run_auto_annotation)
-        self.auto_annotation_delay = 0.1
+        self.auto_annotation_delay = 100
         
         # Frame change tracking for persistence
         self._last_frame_index = None
