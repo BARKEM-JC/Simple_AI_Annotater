@@ -8,6 +8,7 @@ from pathlib import Path
 class LabelManager(QWidget):
     label_changed = pyqtSignal(str, str)  # region_id, new_label
     quick_opencv_annotation_requested = pyqtSignal()  # For quick OpenCV annotation
+    add_template_requested = pyqtSignal(str, str)  # region_id, label - New signal for adding template
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,6 +89,13 @@ class LabelManager(QWidget):
         self.apply_label_btn.setEnabled(False)
         region_layout.addWidget(self.apply_label_btn)
         
+        # Add Template button (NEW)
+        self.add_template_btn = QPushButton("Add as OpenCV Template")
+        self.add_template_btn.clicked.connect(self.add_region_as_template)
+        self.add_template_btn.setEnabled(False)
+        self.add_template_btn.setStyleSheet("QPushButton { background-color: #FF9800; color: white; font-weight: bold; }")
+        region_layout.addWidget(self.add_template_btn)
+        
         # Quick OpenCV annotation button
         self.quick_opencv_btn = QPushButton("Quick OpenCV Auto-Annotate")
         self.quick_opencv_btn.clicked.connect(self.request_quick_opencv_annotation)
@@ -136,12 +144,21 @@ class LabelManager(QWidget):
         self.remove_custom_btn.setEnabled(True)
     
     def on_label_text_changed(self, text):
-        self.apply_label_btn.setEnabled(bool(text.strip()) and self.current_region_id is not None)
+        has_text = bool(text.strip())
+        has_region = self.current_region_id is not None
+        self.apply_label_btn.setEnabled(has_text and has_region)
+        self.add_template_btn.setEnabled(has_text and has_region)
     
     def apply_current_label(self):
         if self.current_region_id and self.current_label_input.text().strip():
             label = self.current_label_input.text().strip()
             self.label_changed.emit(self.current_region_id, label)
+    
+    def add_region_as_template(self):
+        """Add current region as template to OpenCV auto-annotator"""
+        if self.current_region_id and self.current_label_input.text().strip():
+            label = self.current_label_input.text().strip()
+            self.add_template_requested.emit(self.current_region_id, label)
     
     def request_quick_opencv_annotation(self):
         """Request quick OpenCV annotation"""
@@ -155,11 +172,14 @@ class LabelManager(QWidget):
         self.current_region_id = region_id
         if region_id:
             self.region_info_label.setText(f"Region ID: {region_id[:8]}...")
-            self.apply_label_btn.setEnabled(bool(self.current_label_input.text().strip()))
+            has_text = bool(self.current_label_input.text().strip())
+            self.apply_label_btn.setEnabled(has_text)
+            self.add_template_btn.setEnabled(has_text)
             self.quick_opencv_btn.setEnabled(True)
         else:
             self.region_info_label.setText("No region selected")
             self.apply_label_btn.setEnabled(False)
+            self.add_template_btn.setEnabled(False)
             self.quick_opencv_btn.setEnabled(False)
     
     def remove_region(self, region_id):
@@ -167,12 +187,14 @@ class LabelManager(QWidget):
             self.current_region_id = None
             self.region_info_label.setText("No region selected")
             self.apply_label_btn.setEnabled(False)
+            self.add_template_btn.setEnabled(False)
             self.quick_opencv_btn.setEnabled(False)
     
     def clear_regions(self):
         self.current_region_id = None
         self.region_info_label.setText("No region selected")
         self.apply_label_btn.setEnabled(False)
+        self.add_template_btn.setEnabled(False)
         self.quick_opencv_btn.setEnabled(False)
     
     def load_custom_labels(self):

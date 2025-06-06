@@ -243,60 +243,142 @@ class OpenCVAutoAnnotator:
             return True
         return False
     
-    def find_matches(self, frame: np.ndarray, template_ids: Optional[List[str]] = None) -> List[TemplateMatch]:
+    def find_matches(self, frame: np.ndarray, template_ids: Optional[List[str]] = None, 
+                    existing_annotations: Optional[List[Dict]] = None) -> List[TemplateMatch]:
         """
-        Find template matches in the current frame
+        Find all template matches in the frame
         
         Args:
-            frame: Current frame to search in
-            template_ids: List of specific template IDs to use, or None for all
+            frame: Frame to search in
+            template_ids: Optional list of specific template IDs to use
+            existing_annotations: Optional list of existing annotations to avoid duplicates
             
         Returns:
             List of TemplateMatch objects
         """
-        if template_ids is None:
-            template_ids = list(self.templates.keys())
-        
         matches = []
         
-        for template_id in template_ids:
+        templates_to_use = template_ids if template_ids else list(self.templates.keys())
+        
+        for template_id in templates_to_use:
             if template_id not in self.templates:
                 continue
                 
-            template_data = self.templates[template_id]
-            template = template_data['template']
-            label = template_data['label']
-            threshold = template_data['threshold']
+            template_info = self.templates[template_id]
+            template_matches = self._match_template(
+                frame, 
+                template_info['template'], 
+                template_info['threshold']
+            )
             
-            # Perform template matching
-            template_matches = self._match_template(frame, template, threshold)
-            
-            # Update usage count if matches found
-            if template_matches:
-                self.templates[template_id]['usage_count'] = template_data.get('usage_count', 0) + len(template_matches)
-            
-            # Convert to TemplateMatch objects
+            # Add template info to matches
             for match in template_matches:
-                matches.append(TemplateMatch(
+                template_match = TemplateMatch(
                     region=match['region'],
                     confidence=match['confidence'],
-                    label=label,
+                    label=template_info['label'],
                     template_id=template_id
-                ))
+                )
+                matches.append(template_match)
         
-        # Periodically save templates to update usage counts
-        if matches:
-            self.save_templates()
+        # Remove overlapping matches - keep only the best one for each overlapping group
+        matches = self._filter_overlapping_matches(matches, overlap_threshold=0.25)
+        
+        # Filter out matches that overlap significantly with existing annotations
+        if existing_annotations:
+            matches = self._filter_existing_overlaps(matches, existing_annotations)
         
         return matches
     
+    def _filter_overlapping_matches(self, matches: List[TemplateMatch], overlap_threshold: float = 0.25) -> List[TemplateMatch]:
+        """
+        Filter overlapping matches to keep only the best one from each overlapping group
+        
+        Args:
+            matches: List of template matches
+            overlap_threshold: Threshold for considering matches as overlapping (0.25 = 25%)
+            
+        Returns:
+            Filtered list of matches
+        """
+        if not matches:
+            return matches
+        
+        # Sort matches by confidence (descending)
+        sorted_matches = sorted(matches, key=lambda x: x.confidence, reverse=True)
+        filtered_matches = []
+        
+        for current_match in sorted_matches:
+            # Check if this match overlaps significantly with any already accepted match
+            overlaps = False
+            for accepted_match in filtered_matches:
+                if self._regions_overlap(current_match.region, accepted_match.region, overlap_threshold):
+                    # Check which one is bigger (by area) and has higher confidence
+                    current_area = current_match.region['width'] * current_match.region['height']
+                    accepted_area = accepted_match.region['width'] * accepted_match.region['height']
+                    
+                    # If current match is significantly larger or has much higher confidence, replace the accepted match
+                    area_ratio = current_area / accepted_area if accepted_area > 0 else 1
+                    confidence_diff = current_match.confidence - accepted_match.confidence
+                    
+                    if area_ratio > 1.5 or (area_ratio > 1.1 and confidence_diff > 0.1):
+                        # Replace the accepted match with the current one
+                        filtered_matches.remove(accepted_match)
+                        break
+                    else:
+                        overlaps = True
+                        break
+            
+            if not overlaps:
+                filtered_matches.append(current_match)
+        
+        return filtered_matches
+    
+    def _filter_existing_overlaps(self, matches: List[TemplateMatch], existing_annotations: List[Dict]) -> List[TemplateMatch]:
+        """
+        Filter out matches that overlap with existing annotations
+        
+        Args:
+            matches: List of template matches
+            existing_annotations: List of existing annotation regions
+            
+        Returns:
+            Filtered list of matches that don't overlap with existing annotations
+        """
+        filtered_matches = []
+        
+        for match in matches:
+            overlaps_existing = False
+            
+            for existing_annotation in existing_annotations:
+                # Convert existing annotation to region format if needed
+                if 'region' in existing_annotation:
+                    existing_region = existing_annotation['region']
+                else:
+                    existing_region = {
+                        'x': existing_annotation.get('x', 0),
+                        'y': existing_annotation.get('y', 0),
+                        'width': existing_annotation.get('width', 0),
+                        'height': existing_annotation.get('height', 0)
+                    }
+                
+                # Check for overlap
+                if self._regions_overlap(match.region, existing_region, overlap_threshold=0.25):
+                    overlaps_existing = True
+                    break
+            
+            if not overlaps_existing:
+                filtered_matches.append(match)
+        
+        return filtered_matches
+    
     def _match_template(self, frame: np.ndarray, template: np.ndarray, threshold: float) -> List[Dict]:
         """
-        Perform template matching using multiple methods and return best matches
+        Perform template matching using optimized methods to reduce CPU usage
         """
         matches = []
         
-        # Convert to grayscale for better matching
+        # Convert to grayscale for better matching and performance
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
         template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if len(template.shape) == 3 else template
         
@@ -306,41 +388,70 @@ class OpenCVAutoAnnotator:
         if template_h >= frame_gray.shape[0] or template_w >= frame_gray.shape[1]:
             return matches
         
-        # Method 1: Normalized Cross Correlation
+        # Optimize for performance: resize frame if it's very large
+        frame_h, frame_w = frame_gray.shape
+        scale_factor = 1.0
+        if frame_w > 1920 or frame_h > 1080:
+            # Scale down large frames to improve performance
+            scale_factor = min(1920 / frame_w, 1080 / frame_h)
+            new_w = int(frame_w * scale_factor)
+            new_h = int(frame_h * scale_factor)
+            frame_gray = cv2.resize(frame_gray, (new_w, new_h))
+            template_gray = cv2.resize(template_gray, 
+                                     (int(template_w * scale_factor), int(template_h * scale_factor)))
+            template_h, template_w = template_gray.shape
+        
+        # Use normalized cross correlation with reduced precision for speed
         result = cv2.matchTemplate(frame_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+        
+        # Find peaks more efficiently
         locations = np.where(result >= threshold)
         
+        # Limit the number of locations to process to prevent CPU overload
+        max_locations = 50  # Reasonable limit
+        if len(locations[0]) > max_locations:
+            # Sort by confidence and take top matches
+            confidences = result[locations]
+            top_indices = np.argsort(confidences)[-max_locations:]
+            locations = (locations[0][top_indices], locations[1][top_indices])
+        
+        processed_matches = []
         for pt in zip(*locations[::-1]):  # Switch x and y
             confidence = result[pt[1], pt[0]]
             
-            # Check for overlapping matches and keep only the best
+            # Scale coordinates back if we resized the frame
+            x = int(pt[0] / scale_factor)
+            y = int(pt[1] / scale_factor)
+            w = int(template_w / scale_factor)
+            h = int(template_h / scale_factor)
+            
             region = {
-                'x': int(pt[0]),
-                'y': int(pt[1]),
-                'width': template_w,
-                'height': template_h
+                'x': x,
+                'y': y,
+                'width': w,
+                'height': h
             }
             
-            # Check if this overlaps with existing matches
+            # Check for overlapping matches and keep only the best
             overlaps = False
-            for existing_match in matches:
-                if self._regions_overlap(region, existing_match['region']):
+            for existing_match in processed_matches:
+                if self._regions_overlap(region, existing_match['region'], overlap_threshold=0.3):
                     # If new match has higher confidence, replace the old one
                     if confidence > existing_match['confidence']:
-                        matches.remove(existing_match)
+                        processed_matches.remove(existing_match)
                     else:
                         overlaps = True
                     break
             
             if not overlaps:
-                matches.append({
+                processed_matches.append({
                     'region': region,
                     'confidence': float(confidence)
                 })
         
-        # Sort by confidence and limit results
-        matches.sort(key=lambda x: x['confidence'], reverse=True)
-        return matches[:self.max_matches_per_template]
+        # Sort by confidence and limit results to prevent overwhelming the UI
+        processed_matches.sort(key=lambda x: x['confidence'], reverse=True)
+        return processed_matches[:min(self.max_matches_per_template, 10)]  # Further limit results
     
     def _regions_overlap(self, region1: Dict[str, int], region2: Dict[str, int], 
                         overlap_threshold: float = 0.3) -> bool:

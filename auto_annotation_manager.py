@@ -24,30 +24,37 @@ class AutoAnnotationWorker(QThread):
     progress = pyqtSignal(int)
     error = pyqtSignal(str)
     
-    def __init__(self, annotator, frame, method='opencv', custom_labels=None):
+    def __init__(self, annotator, frame, method='opencv', custom_labels=None, existing_annotations=None):
         super().__init__()
         self.annotator = annotator
         self.frame = frame
         self.method = method
         self.custom_labels = custom_labels or []
+        self.existing_annotations = existing_annotations or []
+        # Add frame hash for caching
+        self.frame_hash = hash(frame.tobytes()) if frame is not None else 0
     
     def run(self):
         try:
             if self.method == 'opencv':
-                matches = self.annotator.find_matches(self.frame)
-                result = {
-                    'success': True,
-                    'annotations': [
-                        {
-                            'region': match.region,
-                            'label': match.label,
-                            'confidence': match.confidence,
-                            'template_id': match.template_id,
-                            'type': 'opencv'
-                        }
-                        for match in matches
-                    ]
-                }
+                # Only run if we have templates
+                if not self.annotator.templates:
+                    result = {'success': True, 'annotations': []}
+                else:
+                    matches = self.annotator.find_matches(self.frame, existing_annotations=self.existing_annotations)
+                    result = {
+                        'success': True,
+                        'annotations': [
+                            {
+                                'region': match.region,
+                                'label': match.label,
+                                'confidence': match.confidence,
+                                'template_id': match.template_id,
+                                'type': 'opencv'
+                            }
+                            for match in matches
+                        ]
+                    }
             elif self.method == 'openai':
                 result = self.annotator.annotate_frame(self.frame, self.custom_labels)
                 # Add type indicator
@@ -449,19 +456,28 @@ class AutoAnnotationManager(QWidget):
     
     def run_opencv_annotation(self):
         """Run OpenCV template matching annotation"""
-        if self.current_frame is None or len(self.opencv_annotator.templates) == 0:
+        if self.current_frame is None:
+            QMessageBox.warning(self, "Warning", "No frame loaded")
             return
         
-        # Start worker thread
+        # Get existing annotations to avoid duplicates if auto-apply is enabled
+        existing_annotations = []
+        if hasattr(self.parent(), 'video_player') and self.parent().video_player:
+            for region in self.parent().video_player.regions:
+                region_data = self.parent().video_player.get_region_data(region.id)
+                if region_data:
+                    existing_annotations.append(region_data)
+        
+        self.run_opencv_btn.setEnabled(False)
         self.worker_thread = AutoAnnotationWorker(
-            self.opencv_annotator, self.current_frame, 'opencv'
+            self.opencv_annotator, 
+            self.current_frame, 
+            method='opencv',
+            existing_annotations=existing_annotations
         )
         self.worker_thread.finished.connect(self.on_annotation_finished)
         self.worker_thread.error.connect(self.on_annotation_error)
         self.worker_thread.start()
-        
-        self.run_opencv_btn.setEnabled(False)
-        self.run_opencv_btn.setText("Processing...")
     
     def run_ai_annotation(self):
         """Run OpenAI vision annotation"""
@@ -509,9 +525,6 @@ class AutoAnnotationManager(QWidget):
                     # Auto-apply all annotations
                     for annotation in annotations:
                         self.annotation_accepted.emit(annotation, self.current_frame_index)
-                    
-                    QMessageBox.information(self, "Success", 
-                                          f"Auto-applied {len(annotations)} annotations.")
                 else:
                     # Add to pending annotations for manual review
                     for annotation in annotations:
@@ -749,4 +762,38 @@ class AutoAnnotationManager(QWidget):
         else:
             msg += "File does not exist yet (will be created when you add templates)."
         
-        QMessageBox.information(self, "Templates File Location", msg) 
+        QMessageBox.information(self, "Templates File Location", msg)
+
+    def run_auto_annotation(self, frame, frame_index, existing_annotations=None):
+        """Run auto-annotation for a specific frame (called by main window)"""
+        if frame is None:
+            return
+            
+        self.set_current_frame(frame, frame_index)
+        
+        # Get existing annotations from the calling context or use provided ones
+        if existing_annotations is None:
+            existing_annotations = []
+            if hasattr(self.parent(), 'video_player') and self.parent().video_player:
+                for region in self.parent().video_player.regions:
+                    region_data = self.parent().video_player.get_region_data(region.id)
+                    if region_data:
+                        existing_annotations.append(region_data)
+        
+        # Run OpenCV annotation with existing annotations filter
+        matches = self.opencv_annotator.find_matches(frame, existing_annotations=existing_annotations)
+        
+        # Auto-apply matches if enabled
+        if self.auto_apply_opencv and hasattr(self.parent(), 'video_player'):
+            for match in matches:
+                region_data = {
+                    'x': match.region['x'],
+                    'y': match.region['y'],
+                    'width': match.region['width'],
+                    'height': match.region['height'],
+                    'label': match.label,
+                    'id': f"auto_{match.template_id}_{frame_index}_{len(existing_annotations)}"
+                }
+                self.parent().video_player.add_region_from_data(region_data)
+        
+        return matches 

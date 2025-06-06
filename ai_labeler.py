@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QListWidget, QSplitter, QFrame, QLineEdit, QComboBox,
                             QMessageBox, QSpinBox, QCheckBox, QGroupBox, QGridLayout,
                             QListWidgetItem, QInputDialog, QProgressBar, QStatusBar,
-                            QTabWidget)
+                            QTabWidget, QScrollArea)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, pyqtSlot
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont, QKeySequence
 from PyQt5.QtWidgets import QShortcut
@@ -38,9 +38,37 @@ class AILabelerMainWindow(QMainWindow):
         self.output_dir = Path("labeled_data")
         self.output_dir.mkdir(exist_ok=True)
         
+        # Tracking state
+        self.tracking_active = False
+        self.tracking_start_frame = None
+        self.tracking_end_frame = None
+        self.trackers = []  # List of OpenCV trackers
+        self.tracking_regions = []  # Initial regions and their tracking data
+        
+        # Persistent annotations state
+        self.persistent_annotations = {}  # Map of annotation IDs to their data
+        self.deleted_annotations = set()  # Set of deleted annotation IDs
+        
+        # Auto-annotation state
+        self.auto_annotation_enabled = False
+        self.auto_annotation_timer = QTimer()
+        self.auto_annotation_timer.setSingleShot(True)
+        self.auto_annotation_timer.timeout.connect(self.run_auto_annotation)
+        self.auto_annotation_delay = 500  # 0.5 seconds in milliseconds
+        
+        # Frame change tracking for persistence
+        self.should_persist_annotations = False
+        
         self.init_ui()
         self.setup_shortcuts()
         self.connect_signals()
+        
+    def reset_persistent_annotation_state(self):
+        """Reset all persistent annotation tracking state"""
+        self.persistent_annotations = {}
+        self.deleted_annotations = set()
+        self.should_persist_annotations = False
+        self._last_frame_index = None
         
     def init_ui(self):
         self.setWindowTitle("AI Dataset Labeler")
@@ -49,11 +77,21 @@ class AILabelerMainWindow(QMainWindow):
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # Create scroll area to make the whole page scrollable
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        
+        # Create scrollable content widget
+        scrollable_widget = QWidget()
+        scrollable_layout = QHBoxLayout(scrollable_widget)
         
         # Create splitter for main sections
         splitter = QSplitter(Qt.Horizontal)
-        main_layout.addWidget(splitter)
+        scrollable_layout.addWidget(splitter)
         
         # Left panel - Video and controls
         left_panel = self.create_video_panel()
@@ -65,6 +103,10 @@ class AILabelerMainWindow(QMainWindow):
         
         # Set splitter proportions
         splitter.setSizes([1000, 400])
+        
+        # Add scrollable widget to scroll area
+        scroll_area.setWidget(scrollable_widget)
+        main_layout.addWidget(scroll_area)
         
         # Status bar
         self.status_bar = QStatusBar()
@@ -142,11 +184,42 @@ class AILabelerMainWindow(QMainWindow):
         controls_layout.addLayout(slider_layout)
         layout.addLayout(controls_layout)
         
+        # Tracking controls
+        tracking_layout = QHBoxLayout()
+        self.start_tracking_btn = QPushButton("Start Tracking")
+        self.start_tracking_btn.clicked.connect(self.start_tracking)
+        self.start_tracking_btn.setEnabled(False)
+        tracking_layout.addWidget(self.start_tracking_btn)
+        
+        self.end_tracking_btn = QPushButton("End Tracking")
+        self.end_tracking_btn.clicked.connect(self.end_tracking)
+        self.end_tracking_btn.setEnabled(False)
+        tracking_layout.addWidget(self.end_tracking_btn)
+        
+        self.cancel_tracking_btn = QPushButton("Cancel Tracking")
+        self.cancel_tracking_btn.clicked.connect(self.cancel_tracking)
+        self.cancel_tracking_btn.setEnabled(False)
+        tracking_layout.addWidget(self.cancel_tracking_btn)
+        
+        tracking_layout.addStretch()
+        controls_layout.addLayout(tracking_layout)
+        
         return panel
     
     def create_control_panel(self):
         panel = QFrame()
         layout = QVBoxLayout(panel)
+        
+        # Auto-annotation controls at the top
+        auto_group = QGroupBox("Auto-Annotation Settings")
+        auto_layout = QVBoxLayout(auto_group)
+        
+        self.auto_annotation_checkbox = QCheckBox("Auto-annotate on frame change (0.5s delay)")
+        self.auto_annotation_checkbox.setChecked(self.auto_annotation_enabled)
+        self.auto_annotation_checkbox.stateChanged.connect(self.on_auto_annotation_toggled)
+        auto_layout.addWidget(self.auto_annotation_checkbox)
+        
+        layout.addWidget(auto_group)
         
         # Create tab widget for different labeling modes
         self.tab_widget = QTabWidget()
@@ -189,6 +262,11 @@ class AILabelerMainWindow(QMainWindow):
         self.clear_regions_btn = QPushButton("Clear All Regions")
         self.clear_regions_btn.clicked.connect(self.clear_all_regions)
         region_controls_layout.addWidget(self.clear_regions_btn)
+        
+        self.reset_persistence_btn = QPushButton("Reset Persistence Tracking")
+        self.reset_persistence_btn.clicked.connect(self.reset_persistent_annotation_state)
+        self.reset_persistence_btn.setToolTip("Reset deleted annotation tracking to allow previously deleted annotations to persist again")
+        region_controls_layout.addWidget(self.reset_persistence_btn)
         
         region_layout.addWidget(region_group)
         region_layout.addStretch()
@@ -299,9 +377,12 @@ class AILabelerMainWindow(QMainWindow):
     def connect_signals(self):
         """Connect signals between components"""
         self.label_manager.label_changed.connect(self.on_label_changed)
-        
-        # Connect quick OpenCV annotation signal
         self.label_manager.quick_opencv_annotation_requested.connect(self.on_quick_opencv_annotation_requested)
+        self.label_manager.add_template_requested.connect(self.on_add_template_requested)
+        
+        # Auto-annotation manager signals
+        self.auto_annotation_manager.annotation_accepted.connect(self.on_auto_annotation_accepted)
+        self.auto_annotation_manager.template_created.connect(self.on_template_created)
     
     def setup_shortcuts(self):
         # Video control shortcuts
@@ -322,113 +403,134 @@ class AILabelerMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+E"), self, self.export_dataset)
     
     def load_video(self):
-        file_path, _ = QFileDialog.getOpenFileName(
+        file_dialog = QFileDialog()
+        video_path, _ = file_dialog.getOpenFileName(
             self, "Load Video", "", 
-            "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv);;All Files (*)"
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm);;All Files (*)"
         )
         
-        if file_path:
-            self.video_path = file_path
-            self.images_path = None
-            self.source_type = 'video'
-            self.source_name = Path(file_path).stem  # Video name without extension
-            
-            if self.video_player.load_video(file_path):
+        if video_path:
+            if self.video_player.load_video(video_path):
+                self.video_path = video_path
+                self.images_path = None
+                self.source_type = 'video'
+                self.source_name = Path(video_path).stem
+                
                 self.frame_count = self.video_player.frame_count
                 self.fps = self.video_player.fps
                 
                 # Update UI
-                self.video_info_label.setText(f"Video: {self.source_name} | Frames: {self.frame_count}, FPS: {self.fps:.1f}")
-                self.frame_slider.setRange(0, self.frame_count - 1)
-                self.frame_spinbox.setRange(0, self.frame_count - 1)
-                
-                # Update clip manager with video info
-                self.clip_manager.set_video_info(self.frame_count, self.fps)
+                self.video_info_label.setText(f"Video: {Path(video_path).name} | Frames: {self.frame_count} | FPS: {self.fps:.2f}")
                 
                 # Enable controls
                 self.play_btn.setEnabled(True)
                 self.prev_frame_btn.setEnabled(True)
                 self.next_frame_btn.setEnabled(True)
                 self.skip_btn.setEnabled(True)
-                self.frame_slider.setEnabled(True)
-                self.frame_spinbox.setEnabled(True)
                 
-                self.status_bar.showMessage(f"Loaded: {os.path.basename(file_path)}")
+                # Setup frame slider
+                self.frame_slider.setEnabled(True)
+                self.frame_slider.setRange(0, self.frame_count - 1)
+                self.frame_slider.setValue(0)
+                
+                # Setup frame spinbox
+                self.frame_spinbox.setEnabled(True)
+                self.frame_spinbox.setRange(0, self.frame_count - 1)
+                self.frame_spinbox.setValue(0)
+                
+                # Reset tracking and persistent annotation state
+                self.cancel_tracking()
+                self.reset_persistent_annotation_state()
+                
+                self.status_bar.showMessage(f"Video loaded: {self.frame_count} frames")
             else:
                 QMessageBox.critical(self, "Error", "Failed to load video file")
-    
+
     def load_images(self):
-        """Load a directory of images"""
-        dir_path = QFileDialog.getExistingDirectory(
-            self, "Select Image Directory", ""
-        )
+        """Load a directory of images as a sequence"""
+        folder_dialog = QFileDialog()
+        images_dir = folder_dialog.getExistingDirectory(self, "Select Image Directory")
         
-        if dir_path:
-            images_path = Path(dir_path)
-            # Find all image files
-            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+        if images_dir:
+            # Get all image files from directory
+            image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
             image_files = []
-            for ext in image_extensions:
-                image_files.extend(images_path.glob(f"*{ext}"))
-                image_files.extend(images_path.glob(f"*{ext.upper()}"))
             
-            image_files = sorted(image_files)
+            for ext in image_extensions:
+                image_files.extend(Path(images_dir).glob(f'*{ext}'))
+                image_files.extend(Path(images_dir).glob(f'*{ext.upper()}'))
+            
+            # Sort files by name
+            image_files = sorted(image_files, key=lambda x: x.name.lower())
             
             if not image_files:
-                QMessageBox.warning(self, "Warning", "No image files found in the selected directory")
+                QMessageBox.warning(self, "Warning", "No image files found in selected directory")
                 return
             
-            self.video_path = None
-            self.images_path = images_path
-            self.source_type = 'images'
-            self.source_name = images_path.name  # Directory name
-            
             if self.video_player.load_images(image_files):
+                self.images_path = images_dir
+                self.video_path = None
+                self.source_type = 'images'
+                self.source_name = Path(images_dir).name
+                
                 self.frame_count = len(image_files)
-                self.fps = 30  # Default FPS for images
+                self.fps = 30  # Default FPS for image sequences
                 
                 # Update UI
-                self.video_info_label.setText(f"Images: {self.source_name} | Count: {self.frame_count}")
-                self.frame_slider.setRange(0, self.frame_count - 1)
-                self.frame_spinbox.setRange(0, self.frame_count - 1)
+                self.video_info_label.setText(f"Images: {len(image_files)} files from {Path(images_dir).name}")
                 
-                # Update clip manager with image info
-                self.clip_manager.set_video_info(self.frame_count, self.fps)
-                
-                # Enable controls (but disable play for images)
-                self.play_btn.setEnabled(False)  # No playback for images
+                # Enable controls
+                self.play_btn.setEnabled(True)
                 self.prev_frame_btn.setEnabled(True)
                 self.next_frame_btn.setEnabled(True)
                 self.skip_btn.setEnabled(True)
-                self.frame_slider.setEnabled(True)
-                self.frame_spinbox.setEnabled(True)
                 
-                self.status_bar.showMessage(f"Loaded: {len(image_files)} images from {images_path.name}")
+                # Setup frame slider
+                self.frame_slider.setEnabled(True)
+                self.frame_slider.setRange(0, self.frame_count - 1)
+                self.frame_slider.setValue(0)
+                
+                # Setup frame spinbox
+                self.frame_spinbox.setEnabled(True)
+                self.frame_spinbox.setRange(0, self.frame_count - 1)
+                self.frame_spinbox.setValue(0)
+                
+                # Reset tracking and persistent annotation state
+                self.cancel_tracking()
+                self.reset_persistent_annotation_state()
+                
+                self.status_bar.showMessage(f"Images loaded: {self.frame_count} files")
             else:
-                QMessageBox.critical(self, "Error", "Failed to load images")
+                QMessageBox.critical(self, "Error", "Failed to load image sequence")
     
     def toggle_playback(self):
         if self.video_player.is_playing:
             self.video_player.pause()
             self.play_btn.setText("Play")
         else:
+            self.should_persist_annotations = False  # No persistence during video playback
             self.video_player.play()
             self.play_btn.setText("Pause")
     
     def previous_frame(self):
+        self.should_persist_annotations = False  # No persistence for previous frame
         self.video_player.previous_frame()
     
     def next_frame(self):
+        self.should_persist_annotations = True  # Enable persistence for next frame
         self.video_player.next_frame()
     
     def skip_frames(self):
+        self.should_persist_annotations = False  # No persistence for skip
         self.video_player.skip_frames(10)
     
     def skip_frames_back(self):
+        self.should_persist_annotations = False  # No persistence for skip back
         self.video_player.skip_frames(-10)
     
     def seek_frame(self, frame_index):
         if frame_index != self.current_frame_index:
+            self.should_persist_annotations = False  # No persistence for seek
             self.video_player.seek_frame(frame_index)
             self.frame_spinbox.blockSignals(True)
             self.frame_spinbox.setValue(frame_index)
@@ -436,12 +538,17 @@ class AILabelerMainWindow(QMainWindow):
     
     def seek_frame_spinbox(self, frame_index):
         if frame_index != self.current_frame_index:
+            self.should_persist_annotations = False  # No persistence for spinbox seek
             self.video_player.seek_frame(frame_index)
             self.frame_slider.blockSignals(True)
             self.frame_slider.setValue(frame_index)
             self.frame_slider.blockSignals(False)
     
     def on_frame_changed(self, frame_index, frame):
+        # Save current frame annotations before changing
+        if self.current_frame_index is not None and self.current_frame_index != frame_index:
+            self.save_frame_annotations()
+        
         self.current_frame_index = frame_index
         self.current_frame = frame
         
@@ -456,6 +563,9 @@ class AILabelerMainWindow(QMainWindow):
         # Load frame annotations
         self.load_frame_annotations(frame_index)
         
+        # Apply persistent annotations if moving to next consecutive frame
+        self.apply_persistent_annotations(frame_index)
+        
         # Update clip manager with the current frame
         self.clip_manager.set_current_frame(frame_index)
         
@@ -465,22 +575,121 @@ class AILabelerMainWindow(QMainWindow):
         # Update synthetic data widget with current frame and regions
         self.update_synthetic_data_widget()
         
+        # Enable tracking button if we have regions and not currently tracking
+        self.start_tracking_btn.setEnabled(len(self.video_player.regions) > 0 and not self.tracking_active)
+        
+        # Trigger auto-annotation if enabled
+        if self.auto_annotation_enabled:
+            self.auto_annotation_timer.stop()  # Cancel any pending auto-annotation
+            self.auto_annotation_timer.start(self.auto_annotation_delay)
+        
         self.status_bar.showMessage(f"Frame: {frame_index + 1}/{self.frame_count}")
-    
+
+    def apply_persistent_annotations(self, frame_index):
+        """Apply persistent annotations from the previous frame when moving to next frame"""
+        # Initialize _last_frame_index if it doesn't exist
+        if not hasattr(self, '_last_frame_index') or self._last_frame_index is None:
+            self._last_frame_index = frame_index
+            return
+        
+        # Only apply persistence when explicitly requested (next frame button pressed)
+        if not self.should_persist_annotations:
+            self._last_frame_index = frame_index
+            return
+        
+        # Reset the flag after checking
+        self.should_persist_annotations = False
+        
+        # Check if we're moving forward to the next consecutive frame
+        if self._last_frame_index == frame_index - 1:
+            # Check if current frame already has annotations - if so, don't override
+            current_annotation_file = self.output_dir / f"frame_{frame_index:06d}.json"
+            if current_annotation_file.exists():
+                self._last_frame_index = frame_index
+                return
+            
+            # Get annotations from the previous frame
+            source_frame_index = self._last_frame_index
+            source_annotation_file = self.output_dir / f"frame_{source_frame_index:06d}.json"
+            
+            if source_annotation_file.exists():
+                try:
+                    with open(source_annotation_file, 'r') as f:
+                        source_data = json.load(f)
+                    
+                    # Copy all regions from previous frame (except those marked as deleted)
+                    persistent_regions = []
+                    for i, region_data in enumerate(source_data.get('regions', [])):
+                        region_id = region_data.get('id', '')
+                        
+                        # Skip regions that were marked as deleted in the current session
+                        # Use a more robust check that considers the base ID without frame prefix
+                        base_id = region_id.replace(f'persistent_{source_frame_index}_', '')
+                        if any(deleted_id in region_id or region_id in deleted_id or base_id in deleted_id for deleted_id in self.deleted_annotations):
+                            continue
+                        
+                        # Create new region with updated ID for this frame
+                        new_region_data = region_data.copy()
+                        new_region_data['id'] = f"persistent_{frame_index}_{i}"
+                        new_region_data['persistent'] = True
+                        persistent_regions.append(new_region_data)
+                        
+                        # Add to video player immediately
+                        self.video_player.add_region_from_data(new_region_data)
+                    
+                    # Also persist frame labels
+                    frame_labels = source_data.get('frame_labels', [])
+                    
+                    # Update UI with persisted frame labels
+                    self.frame_labels_list.clear()
+                    for label in frame_labels:
+                        item = QListWidgetItem(label)
+                        self.frame_labels_list.addItem(item)
+                    
+                    # Save persistent annotations to current frame if we have any
+                    if persistent_regions or frame_labels:
+                        current_data = {
+                            'frame_index': frame_index,
+                            'video_path': self.video_path,
+                            'frame_labels': frame_labels,
+                            'regions': persistent_regions,
+                            'timestamp': time.time()
+                        }
+                        
+                        with open(current_annotation_file, 'w') as f:
+                            json.dump(current_data, f, indent=2)
+                        
+                        self.status_bar.showMessage(f"Persisted {len(persistent_regions)} annotations from previous frame")
+                
+                except Exception as e:
+                    print(f"Error applying persistent annotations: {e}")
+        
+        # Update last frame index for next consecutive check
+        self._last_frame_index = frame_index
+
     def on_region_added(self, region_data):
         # Add region to label manager
         self.label_manager.add_region(region_data)
         
+        # Store in persistent annotations
+        region_id = region_data.get('id')
+        if region_id:
+            self.persistent_annotations[region_id] = region_data.copy()
+            # Remove from deleted annotations if it was previously deleted
+            original_id = region_data.get('original_id', region_id)
+            self.deleted_annotations.discard(original_id)
+        
         # Automatically assign current label if one is selected
         current_label = self.label_manager.get_current_label()
         if current_label:
-            region_id = region_data.get('id')
             if region_id:
                 # Apply the label to the region
                 self.video_player.set_region_label(region_id, current_label)
+                # Update persistent annotations
+                self.persistent_annotations[region_id]['label'] = current_label
                 # Save frame automatically when label is applied
                 self.save_frame_annotations()
-    
+
     def on_region_selected(self, region_id):
         # Update UI based on selected region
         self.delete_region_btn.setEnabled(region_id is not None and region_id != "")
@@ -522,6 +731,25 @@ class AILabelerMainWindow(QMainWindow):
     def delete_selected_region(self):
         selected_region = self.video_player.get_selected_region()
         if selected_region:
+            # Disable persistence when deleting regions
+            self.should_persist_annotations = False
+            
+            # Add the region ID and its base ID to deleted annotations to prevent persistence
+            self.deleted_annotations.add(selected_region)
+            
+            # Also add the base ID (without frame prefix) to prevent future persistence
+            if selected_region.startswith('persistent_'):
+                # Extract base ID pattern: persistent_framenum_index -> index
+                parts = selected_region.split('_')
+                if len(parts) >= 3:
+                    base_index = parts[2]
+                    self.deleted_annotations.add(base_index)
+                    # Also add pattern to catch other variations
+                    self.deleted_annotations.add(f"persistent_*_{base_index}")
+            
+            # Remove from persistent annotations
+            self.persistent_annotations.pop(selected_region, None)
+            
             self.video_player.delete_region(selected_region)
             self.label_manager.remove_region(selected_region)
             self.delete_region_btn.setEnabled(False)
@@ -529,6 +757,9 @@ class AILabelerMainWindow(QMainWindow):
             self.save_frame_annotations()
     
     def clear_all_regions(self):
+        # Disable persistence when clearing all regions
+        self.should_persist_annotations = False
+        
         self.video_player.clear_regions()
         self.label_manager.clear_regions()
         self.delete_region_btn.setEnabled(False)
@@ -545,15 +776,16 @@ class AILabelerMainWindow(QMainWindow):
     def save_current_frame(self):
         if self.current_frame is not None:
             self.save_frame_annotations()
-            self.status_bar.showMessage("Frame annotations saved", 2000)
+            self.status_bar.showMessage("Frame annotations saved", 1000)
     
     def load_frame_annotations(self, frame_index):
         # Load annotations for current frame
         annotation_file = self.output_dir / f"frame_{frame_index:06d}.json"
         
-        # Clear current annotations
+        # Clear current annotations but keep deletion tracking for persistence
         self.frame_labels_list.clear()
         self.video_player.clear_regions()
+        # DO NOT clear deleted_annotations - keep them to prevent persistence of deleted regions
         
         if annotation_file.exists():
             try:
@@ -801,4 +1033,406 @@ class AILabelerMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "Failed to load synthetic image in video player")
                 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error loading synthetic image:\n{str(e)}") 
+            QMessageBox.critical(self, "Error", f"Error loading synthetic image:\n{str(e)}")
+
+    def start_tracking(self):
+        """Start tracking all annotations on the current frame"""
+        if self.current_frame is None or len(self.video_player.regions) == 0:
+            QMessageBox.warning(self, "Warning", "No frame loaded or no annotations to track")
+            return
+        
+        # Initialize tracking
+        self.tracking_active = True
+        self.tracking_start_frame = self.current_frame_index
+        self.tracking_end_frame = None
+        self.trackers = []
+        self.tracking_regions = []
+        
+        # Initialize trackers for each region
+        start_frame = self.current_frame.copy()
+        for region in self.video_player.regions:
+            try:
+                # Create tracker - trying different tracker types for better compatibility
+                tracker = None
+                tracker_name = "Unknown"
+                
+                # Try different trackers in order of preference
+                try:
+                    tracker = cv2.legacy.TrackerCSRT_create()
+                    tracker_name = "CSRT"
+                except:
+                    try:
+                        tracker = cv2.legacy.TrackerKCF_create()
+                        tracker_name = "KCF"
+                    except:
+                        try:
+                            tracker = cv2.legacy.TrackerMIL_create()
+                            tracker_name = "MIL"
+                        except:
+                            # Fallback for newer OpenCV versions
+                            try:
+                                tracker = cv2.TrackerCSRT_create()
+                                tracker_name = "CSRT"
+                            except:
+                                try:
+                                    tracker = cv2.TrackerKCF_create()
+                                    tracker_name = "KCF"
+                                except:
+                                    pass
+                
+                if tracker is None:
+                    print(f"Could not create tracker for region {region.id}")
+                    continue
+                
+                # Get region bounds
+                bbox = (region.x, region.y, region.width, region.height)
+                
+                # Initialize tracker
+                success = tracker.init(start_frame, bbox)
+                if success:
+                    self.trackers.append(tracker)
+                    region_data = self.video_player.get_region_data(region.id)
+                    self.tracking_regions.append({
+                        'original_data': region_data.copy(),
+                        'region_id': region.id,
+                        'label': region.label,
+                        'initial_bbox': bbox,
+                        'tracker_type': tracker_name
+                    })
+                    print(f"Initialized {tracker_name} tracker for region {region.id}")
+                else:
+                    print(f"Failed to initialize tracker for region {region.id}")
+                    
+            except Exception as e:
+                print(f"Error creating tracker for region {region.id}: {e}")
+        
+        if self.trackers:
+            # Update UI
+            self.start_tracking_btn.setEnabled(False)
+            self.end_tracking_btn.setEnabled(True)
+            self.cancel_tracking_btn.setEnabled(False)
+            self.status_bar.showMessage(f"Tracking started at frame {self.tracking_start_frame + 1}. Initialized {len(self.trackers)} trackers.")
+        else:
+            # No trackers could be initialized
+            self.cancel_tracking()
+            QMessageBox.warning(self, "Warning", "Could not initialize any trackers. OpenCV tracking may not be available.")
+
+    def end_tracking(self):
+        """End tracking and apply tracked positions to all frames between start and end"""
+        if not self.tracking_active or not self.trackers:
+            return
+        
+        self.tracking_end_frame = self.current_frame_index
+        
+        if self.tracking_end_frame <= self.tracking_start_frame:
+            QMessageBox.warning(self, "Warning", "End frame must be after start frame")
+            return
+        
+        try:
+            # Apply tracking to all frames
+            self.apply_tracking_to_frames()
+            self.status_bar.showMessage(f"Tracking completed from frame {self.tracking_start_frame + 1} to {self.tracking_end_frame + 1}")
+            
+        except Exception as e:
+            print(f"Error during tracking: {e}")
+            QMessageBox.critical(self, "Error", f"Tracking failed: {str(e)}")
+        
+        finally:
+            # Clean up tracking state
+            self.tracking_active = False
+            self.trackers = []
+            self.tracking_regions = []
+            
+            # Update UI
+            self.start_tracking_btn.setEnabled(True)
+            self.end_tracking_btn.setEnabled(False)
+            self.cancel_tracking_btn.setEnabled(False)
+            
+            # Refresh current frame to show updated annotations
+            self.load_frame_annotations(self.current_frame_index)
+
+    def cancel_tracking(self):
+        """Cancel tracking and restore original state"""
+        self.tracking_active = False
+        self.tracking_start_frame = None
+        self.tracking_end_frame = None
+        self.trackers = []
+        self.tracking_regions = []
+        
+        # Update UI
+        self.start_tracking_btn.setEnabled(True)
+        self.end_tracking_btn.setEnabled(False)
+        self.cancel_tracking_btn.setEnabled(False)
+        self.status_bar.showMessage("Tracking cancelled")
+
+    def apply_tracking_to_frames(self):
+        """Apply actual object tracking to all frames between start and end"""
+        if not self.tracking_active or not self.trackers:
+            return
+        
+        # Store current frame index to restore later
+        original_frame_index = self.current_frame_index
+        
+        # Reset trackers to start frame
+        self.video_player.seek_frame(self.tracking_start_frame)
+        start_frame = self.current_frame.copy()
+        
+        # Re-initialize trackers at start frame to ensure they're fresh
+        fresh_trackers = []
+        for i, (tracker, region_info) in enumerate(zip(self.trackers, self.tracking_regions)):
+            try:
+                # Create fresh tracker of same type
+                fresh_tracker = None
+                tracker_type = region_info.get('tracker_type', 'CSRT')
+                
+                if tracker_type == "CSRT":
+                    try:
+                        fresh_tracker = cv2.legacy.TrackerCSRT_create()
+                    except:
+                        fresh_tracker = cv2.TrackerCSRT_create()
+                elif tracker_type == "KCF":
+                    try:
+                        fresh_tracker = cv2.legacy.TrackerKCF_create()
+                    except:
+                        fresh_tracker = cv2.TrackerKCF_create()
+                elif tracker_type == "MIL":
+                    try:
+                        fresh_tracker = cv2.legacy.TrackerMIL_create()
+                    except:
+                        fresh_tracker = cv2.TrackerMIL_create()
+                
+                if fresh_tracker and fresh_tracker.init(start_frame, region_info['initial_bbox']):
+                    fresh_trackers.append(fresh_tracker)
+                else:
+                    fresh_trackers.append(None)
+                    print(f"Failed to reinitialize tracker {i}")
+                    
+            except Exception as e:
+                print(f"Error reinitializing tracker {i}: {e}")
+                fresh_trackers.append(None)
+        
+        # Track through each frame
+        for frame_idx in range(self.tracking_start_frame + 1, self.tracking_end_frame + 1):
+            try:
+                # Load the frame
+                self.video_player.seek_frame(frame_idx)
+                current_frame = self.current_frame.copy()
+                
+                if current_frame is None:
+                    print(f"Could not load frame {frame_idx}")
+                    continue
+                
+                # Update all trackers
+                tracked_regions = []
+                for i, (tracker, region_info) in enumerate(zip(fresh_trackers, self.tracking_regions)):
+                    if tracker is None:
+                        # If tracker failed, use original position (fallback)
+                        original_data = region_info['original_data']
+                        tracked_regions.append(original_data.copy())
+                        continue
+                    
+                    try:
+                        success, bbox = tracker.update(current_frame)
+                        if success:
+                            x, y, w, h = [int(v) for v in bbox]
+                            # Create tracked region data
+                            tracked_region = region_info['original_data'].copy()
+                            tracked_region.update({
+                                'id': f"tracked_{region_info['region_id']}_{frame_idx}",
+                                'x': x,
+                                'y': y,
+                                'width': w,
+                                'height': h,
+                                'tracked': True,
+                                'source_frame': self.tracking_start_frame,
+                                'tracker_type': region_info.get('tracker_type', 'Unknown')
+                            })
+                            tracked_regions.append(tracked_region)
+                        else:
+                            # Tracking failed, use original position
+                            print(f"Tracking failed for region {i} at frame {frame_idx}")
+                            original_data = region_info['original_data'].copy()
+                            original_data['id'] = f"fallback_{region_info['region_id']}_{frame_idx}"
+                            original_data['tracked'] = False
+                            original_data['tracking_failed'] = True
+                            tracked_regions.append(original_data)
+                            
+                    except Exception as e:
+                        print(f"Error updating tracker {i} at frame {frame_idx}: {e}")
+                        # Use original position as fallback
+                        original_data = region_info['original_data'].copy()
+                        original_data['id'] = f"error_{region_info['region_id']}_{frame_idx}"
+                        tracked_regions.append(original_data)
+                
+                # Save tracked annotations to this frame
+                self.save_tracked_annotations(frame_idx, tracked_regions)
+                
+            except Exception as e:
+                print(f"Error processing frame {frame_idx}: {e}")
+                continue
+        
+        # Restore original frame
+        if original_frame_index is not None:
+            self.video_player.seek_frame(original_frame_index)
+
+    def save_tracked_annotations(self, frame_idx, tracked_regions):
+        """Save tracked regions to a specific frame"""
+        try:
+            annotation_file = self.output_dir / f"frame_{frame_idx:06d}.json"
+            
+            # Load existing data or create new
+            frame_data = {
+                'frame_index': frame_idx,
+                'video_path': self.video_path,
+                'frame_labels': [],
+                'regions': [],
+                'timestamp': time.time()
+            }
+            
+            # Load existing annotations if they exist
+            if annotation_file.exists():
+                try:
+                    with open(annotation_file, 'r') as f:
+                        frame_data = json.load(f)
+                except Exception as e:
+                    print(f"Error loading existing annotations for frame {frame_idx}: {e}")
+            
+            # Get existing regions and remove old tracked regions
+            existing_regions = [r for r in frame_data.get('regions', []) if not r.get('tracked', False)]
+            
+            # Add new tracked regions
+            all_regions = existing_regions + tracked_regions
+            frame_data['regions'] = all_regions
+            frame_data['timestamp'] = time.time()
+            
+            # Save annotations
+            with open(annotation_file, 'w') as f:
+                json.dump(frame_data, f, indent=2)
+                
+        except Exception as e:
+            print(f"Error saving tracked annotations for frame {frame_idx}: {e}")
+
+    def find_overlapping_region(self, track_region, existing_regions):
+        """Find if there's an existing region that overlaps significantly with the track region"""
+        track_x = track_region.get('x', 0)
+        track_y = track_region.get('y', 0)
+        track_w = track_region.get('width', 0)
+        track_h = track_region.get('height', 0)
+        
+        for i, existing_region in enumerate(existing_regions):
+            existing_x = existing_region.get('x', 0)
+            existing_y = existing_region.get('y', 0)
+            existing_w = existing_region.get('width', 0)
+            existing_h = existing_region.get('height', 0)
+            
+            # Calculate overlap
+            overlap_x = max(0, min(track_x + track_w, existing_x + existing_w) - max(track_x, existing_x))
+            overlap_y = max(0, min(track_y + track_h, existing_y + existing_h) - max(track_y, existing_y))
+            overlap_area = overlap_x * overlap_y
+            
+            # Calculate areas
+            track_area = track_w * track_h
+            existing_area = existing_w * existing_h
+            
+            # Check if overlap is significant (more than 50% of either region)
+            if track_area > 0 and existing_area > 0:
+                overlap_ratio_track = overlap_area / track_area
+                overlap_ratio_existing = overlap_area / existing_area
+                
+                if overlap_ratio_track > 0.5 or overlap_ratio_existing > 0.5:
+                    return i
+        
+        return None
+
+    def on_auto_annotation_toggled(self, state):
+        """Handle auto-annotation checkbox toggled"""
+        self.auto_annotation_enabled = state == Qt.Checked
+        if not self.auto_annotation_enabled:
+            self.auto_annotation_timer.stop()
+
+    def run_auto_annotation(self):
+        """Run auto-annotation for the current frame"""
+        if not self.auto_annotation_enabled or self.current_frame is None:
+            return
+            
+        # Don't run if no templates exist
+        if not self.auto_annotation_manager.opencv_annotator.templates:
+            return
+            
+        # Get existing annotations to avoid duplicates
+        existing_annotations = []
+        for region in self.video_player.regions:
+            region_data = self.video_player.get_region_data(region.id)
+            if region_data:
+                existing_annotations.append(region_data)
+        
+        # Run OpenCV auto-annotation with existing annotations filter
+        try:
+            matches = self.auto_annotation_manager.opencv_annotator.find_matches(
+                self.current_frame, 
+                existing_annotations=existing_annotations
+            )
+            
+            # Only apply matches if auto-apply is enabled and we have high-confidence matches
+            high_confidence_matches = [match for match in matches if match.confidence > 0.8]
+            
+            # Apply the high-confidence matches as annotations
+            if high_confidence_matches:
+                for match in high_confidence_matches:
+                    region_data = {
+                        'x': match.region['x'],
+                        'y': match.region['y'],
+                        'width': match.region['width'],
+                        'height': match.region['height'],
+                        'label': match.label,
+                        'id': f"auto_{match.template_id}_{self.current_frame_index}_{len(existing_annotations)}"
+                    }
+                    self.video_player.add_region_from_data(region_data)
+                
+                self.save_frame_annotations()
+                self.status_bar.showMessage(f"Auto-annotation: {len(high_confidence_matches)} high-confidence matches found")
+            elif matches:
+                # For lower confidence matches, just show a subtle status message
+                self.status_bar.showMessage(f"Auto-annotation: {len(matches)} potential matches found (low confidence)")
+        except Exception as e:
+            print(f"Auto-annotation error: {e}")
+            # Don't show error messages to user for auto-annotation failures
+
+    def is_auto_annotation_enabled(self):
+        """Return whether auto-annotation is enabled"""
+        return self.auto_annotation_enabled
+
+    def get_auto_annotation_delay(self):
+        """Return the current auto-annotation delay"""
+        return self.auto_annotation_delay
+
+    def set_auto_annotation_delay(self, delay):
+        """Set the auto-annotation delay"""
+        self.auto_annotation_delay = delay
+
+    def on_add_template_requested(self, region_id, label):
+        """Handle request to add current region as template"""
+        if not self.current_frame is None and region_id:
+            region_data = self.video_player.get_region_data(region_id)
+            if region_data:
+                region_rect = {
+                    'x': region_data.get('x', 0),
+                    'y': region_data.get('y', 0),
+                    'width': region_data.get('width', 0),
+                    'height': region_data.get('height', 0)
+                }
+                
+                # Add template to OpenCV auto-annotator
+                template_id = self.auto_annotation_manager.opencv_annotator.add_template_from_region(
+                    self.current_frame, region_rect, label
+                )
+                
+                if template_id:
+                    # Save templates
+                    self.auto_annotation_manager.opencv_annotator.save_templates()
+                    # Update template list in auto-annotation manager
+                    self.auto_annotation_manager.update_template_list()
+                    # Show success message only in status bar
+                    self.status_bar.showMessage(f"Template '{label}' created successfully")
+                else:
+                    self.status_bar.showMessage("Failed to create template") 
